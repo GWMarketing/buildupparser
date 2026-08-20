@@ -4,24 +4,23 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-# Allow cross-origin requests from Hostinger / browsers
 CORS(app)
 
-VALID_UNITS = {"SQ", "EA", "LF", "SF", "SY", "HR", "DA", "MO", "WK", "LS"}
+VALID_UNITS = {"SQ", "EA", "LF", "SF", "SY", "HR", "DA", "MO", "WK", "LS", "BF", "TN", "GL", "CL"}
 
 TRADE_SYNONYMS = {
     "Roofing": ["roof", "shingle", "felt", "underlayment", "ridge cap", "drip edge", "valley", "flashing", "pipe jack", "starter", "ice & water", "mod bit", "tpo", "eaves"],
     "Drywall & Texture": ["drywall", "sheetrock", "gypsum", "plaster", "stucco", "texture", "taped", "floated", "hang", "acoustic", "popcorn", "mud"],
     "Painting": ["paint", "seal", "prime", "stain", "latex", "enamel", "caulk", "two coats", "one coat", "masking"],
-    "Demolition": ["tear off", "remove", "haul", "dispose", "dump", "debris removal", "demolish", "take off", "detach", "water extraction", "remediation"],
+    "Demolition": ["tear off", "remove", "haul", "dispose", "dump", "debris removal", "demolish", "take off", "detach", "water extraction", "remediation", "cut down", "tree"],
     "Siding": ["siding", "soffit", "fascia", "cladding", "corner post", "j-channel", "wrap", "hardie", "vinyl"],
     "Electrical": ["electric", "wire", "fixture", "outlet", "switch", "breaker", "panel", "lighting", "receptacle", "conduit", "junction"],
     "Plumbing": ["plumb", "pipe", "drain", "sink", "faucet", "toilet", "water heater", "p-trap", "valve", "supply line"],
     "HVAC / Mechanical": ["hvac", "heat", "air cond", "furnace", "duct", "condenser", "vent", "flue", "thermostat", "refrigerant"],
     "Flooring": ["carpet", "pad", "tile", "hardwood", "vinyl plank", "lvp", "underlay", "grout", "baseboard"],
     "Insulation": ["insul", "batt", "blown", "r30", "r38", "r19", "r13", "fiberglass", "vapor barrier"],
-    "Tree / Grounds": ["tree", "cut down", "stump", "branches", "limbs", "landscaping", "lawn", "grounds"],
-    "General Conditions": ["general conditions", "delivery", "permit", "container", "storage", "dumpster", "supervis", "cleanup", "final clean", "barricade", "safety", "protection", "food loss", "bid item", "laundering"]
+    "Tree / Grounds": ["tree", "stump", "branches", "limbs", "landscaping", "lawn", "grounds", "cut down"],
+    "General Conditions": ["general conditions", "delivery", "permit", "container", "storage", "dumpster", "supervis", "cleanup", "final clean", "barricade", "safety", "protection", "food loss", "bid item", "allowance", "laundering"]
 }
 
 def classify_trade(text: str) -> str:
@@ -71,7 +70,7 @@ def parse_endpoint():
 
     full_document_str = "\n".join(full_text_lines)
 
-    # 1. Metadata
+    # 1. Metadata Extraction
     claim_m = re.search(r"Claim\s*(?:#|Number)?[:\s]*([A-Za-z0-9-]+)", full_document_str, re.IGNORECASE)
     if claim_m: baseline["claim_number"] = claim_m.group(1)
 
@@ -86,9 +85,9 @@ def parse_endpoint():
     if date_m: baseline["loss_date"] = date_m.group(1).strip()
 
     # 2. Adjuster Ground Truth Totals
-    recap_m = re.findall(r"Coverage\s+Item\s+Total[\s\S]+?Total\s+([\d,]+\.\d{2})", full_document_str, re.IGNORECASE)
-    if recap_m:
-        baseline["doc_direct_total"] = clean_num(recap_m[0])
+    multi_cov_total = re.search(r"Coverage\s+Item\s+Total[\s\S]+?Total\s+([\d,]+\.\d{2})\s+100\.00%", full_document_str, re.IGNORECASE)
+    if multi_cov_total:
+        baseline["doc_direct_total"] = clean_num(multi_cov_total.group(1))
     else:
         direct_matches = re.findall(r"Line\s+Item\s+Total(?:s)?\s*[:\s]*([A-Za-z0-9_]+)?\s*([\d,]+\.\d{2})?", full_document_str, re.IGNORECASE)
         sum_direct = 0.0
@@ -111,13 +110,14 @@ def parse_endpoint():
     ded_m = re.search(r"(?:Deductible|Less Deductible)\s*[:\$\(]?\s*([\d,]+\.\d{2})", full_document_str, re.IGNORECASE)
     if ded_m: baseline["doc_deductible"] = clean_num(ded_m.group(1))
 
-    # 3. Scope Items & Shielding
+    # 3. Robust Line Item Parsing
     pending_desc = ""
 
     for line in full_text_lines:
         clean_line = line.strip()
         low = clean_line.lower()
 
+        # Dimension / CAD Shield
         if any(token in low for token in [
             "surface area", "perimeter length", "sf walls", "sf ceiling", "sf floor",
             "sy flooring", "lf floor", "lf ceil", "floor area", "interior wall area",
@@ -126,29 +126,18 @@ def parse_endpoint():
         ]) or low.startswith(("totals:", "total:", "subtotal:")):
             continue
 
-        words = clean_line.split()
-        unit_idx = -1
-        unit_token = ""
+        # Regex to capture: [Qty] [Unit] [Price] [Optional Tax/OP] [Line Total]
+        units_pattern = "|".join(VALID_UNITS)
+        item_pattern = rf"(\d+[\d,]*\.\d{{2}})\s*({units_pattern})\s+[\$]?(\d+[\d,]*\.\d{{2}})(?:\s+[\$]?\d+[\d,]*\.\d{{2}})*\s+[\$]?(\d+[\d,]*\.\d{{2}})"
+        match = re.search(item_pattern, clean_line, re.IGNORECASE)
 
-        for idx, w in enumerate(words):
-            clean_w = re.sub(r"[^A-Za-z]", "", w).upper()
-            if clean_w in VALID_UNITS:
-                prev_val = clean_num(words[idx - 1]) if idx > 0 else 0
-                next_val = clean_num(words[idx + 1]) if idx + 1 < len(words) else 0
-                if prev_val > 0 and next_val >= 0:
-                    unit_idx = idx
-                    unit_token = clean_w
-                    break
-
-        if unit_idx != -1:
-            qty = clean_num(words[unit_idx - 1])
-            price = clean_num(words[unit_idx + 1])
-            desc = pending_desc
-
-            if unit_idx > 1:
-                line_desc = " ".join(words[:unit_idx - 1])
-                desc = (desc + " " + line_desc).strip()
-
+        if match:
+            qty = clean_num(match.group(1))
+            unit = match.group(2).upper()
+            price = clean_num(match.group(3))
+            
+            line_desc = clean_line[:match.start()].strip()
+            desc = (pending_desc + " " + line_desc).strip()
             desc = re.sub(r"^\d+\.\s*", "", desc)
             desc = re.sub(r"\*+$", "", desc).strip()
 
@@ -156,35 +145,37 @@ def parse_endpoint():
                 parsed_items.append({
                     "trade": classify_trade(desc),
                     "description": desc,
-                    "quantity": qty,
-                    "unit": unit_token,
+                    "qty": qty,
+                    "unit": unit,
                     "unit_price": price
                 })
             pending_desc = ""
 
-        elif re.match(r"^\d+\.\s+", clean_line) or re.match(r"^(?:R&R|Remove|Replace)\s+", clean_line, re.IGNORECASE):
-            trailing_m = re.match(r"^(\d+\.\s+)?(.+?)\s+[\$]?([\d,]+\.\d{2})$", clean_line)
-            if trailing_m:
-                desc = (pending_desc + " " + trailing_m.group(2)).strip()
-                desc = re.sub(r"^\d+\.\s*", "", desc).strip()
+        else:
+            # Fallback for sequence-numbered items without standard units (e.g. flat allowances)
+            trailing_m = re.search(r"^(\d+\.\s+)?(.+?)\s+[\$]?([\d,]+\.\d{2})(?:\s+[\$]?[\d,]+\.\d{2})*$", clean_line)
+            if trailing_m and not low.startswith(("line item", "coverage", "net claim", "replacement cost")):
+                desc_candidate = (pending_desc + " " + trailing_m.group(2)).strip()
+                desc_candidate = re.sub(r"^\d+\.\s*", "", desc_candidate).strip()
                 cost = clean_num(trailing_m.group(3))
-                if len(desc) > 3 and cost > 0:
+                
+                if len(desc_candidate) > 4 and cost > 0 and not any(k in desc_candidate.lower() for k in ["total", "page:", "continued"]):
                     parsed_items.append({
-                        "trade": classify_trade(desc),
-                        "description": desc,
-                        "quantity": "N/A",
+                        "trade": classify_trade(desc_candidate),
+                        "description": desc_candidate,
+                        "qty": "N/A",
                         "unit": "N/A",
                         "unit_price": cost
                     })
                     pending_desc = ""
                     continue
-            pending_desc = clean_line
-        elif pending_desc:
-            pending_desc += " " + clean_line
+            
+            if re.match(r"^\d+\.\s+", clean_line) or pending_desc:
+                pending_desc = (pending_desc + " " + clean_line).strip()
 
-    # 4. Math Reconciliation Assertion
+    # 4. Accounting Reconciliation Assertion
     parsed_sum = sum(
-        item["unit_price"] if item["quantity"] == "N/A" else (item["quantity"] * item["unit_price"])
+        item["unit_price"] if item["qty"] == "N/A" else (float(item["qty"]) * item["unit_price"])
         for item in parsed_items
     )
     target_direct = baseline["doc_direct_total"] if baseline["doc_direct_total"] > 0 else parsed_sum
